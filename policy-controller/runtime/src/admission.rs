@@ -20,7 +20,12 @@ use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
 #[derive(Clone)]
-pub struct Admission {}
+pub struct Admission {
+    /// The live inbound policy index, used for read-only dry-run authorization
+    /// evaluations. Dry-runs only read the index; Kubernetes objects are never
+    /// created or modified.
+    index: index::inbound::SharedIndex,
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -72,7 +77,7 @@ impl tower::Service<Request<hyper::body::Incoming>> for Admission {
 
     fn call(&mut self, req: Request<hyper::body::Incoming>) -> Self::Future {
         trace!(?req);
-        if req.method() != http::Method::POST || req.uri().path() != "/" {
+        if req.method() != http::Method::POST {
             return Box::pin(future::ok(
                 Response::builder()
                     .status(http::StatusCode::NOT_FOUND)
@@ -81,8 +86,23 @@ impl tower::Service<Request<hyper::body::Incoming>> for Admission {
             ));
         }
 
+        let path = req.uri().path().to_string();
         let admission = self.clone();
         Box::pin(async move {
+            // The dry-run authorization API. Unlike admission reviews, this
+            // evaluates an explicit (namespace, pod, port, client) tuple
+            // against the live index without involving the Kubernetes API.
+            if path == "/dryrun" {
+                return admission.dry_run_http(req).await;
+            }
+
+            if path != "/" {
+                return Ok(Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body(Body::default())
+                    .expect("not found response must be valid"));
+            }
+
             use bytes::Buf;
             let bytes = req.into_body().collect().await?.to_bytes();
             let review: Review = match serde_json::from_reader(bytes.reader()) {
@@ -111,8 +131,49 @@ impl tower::Service<Request<hyper::body::Incoming>> for Admission {
 }
 
 impl Admission {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(index: index::inbound::SharedIndex) -> Self {
+        Self { index }
+    }
+
+    /// Handles `POST /dryrun`: a JSON [`index::inbound::DryRunRequest`] is
+    /// evaluated against a single consistent index snapshot and answered with
+    /// a JSON [`index::inbound::DryRunResponse`]. Nothing is persisted to the
+    /// Kubernetes API.
+    async fn dry_run_http(
+        self,
+        req: Request<hyper::body::Incoming>,
+    ) -> std::result::Result<Response<Body>, Error> {
+        use bytes::Buf;
+        let bytes = req.into_body().collect().await?.to_bytes();
+        let request: index::inbound::DryRunRequest = match serde_json::from_reader(bytes.reader()) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(%error, "Failed to parse dry-run request");
+                return json_error_response(http::StatusCode::BAD_REQUEST, &error.to_string());
+            }
+        };
+
+        // Holding the read guard for the whole evaluation ensures that the
+        // response's resourceVersion cannot mix with a concurrent policy
+        // update.
+        match self.index.read().dry_run(request) {
+            Ok(response) => {
+                let body = serde_json::to_vec(&response)?;
+                Ok(Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("dry-run response must be valid"))
+            }
+            Err(error) => {
+                let status = if error.is_not_found() {
+                    http::StatusCode::NOT_FOUND
+                } else {
+                    http::StatusCode::BAD_REQUEST
+                };
+                json_error_response(status, &error.to_string())
+            }
+        }
     }
 
     async fn admit(self, req: AdmissionRequest) -> AdmissionResponse {
@@ -133,6 +194,12 @@ impl Admission {
         };
 
         if is_kind::<ServerAuthorization>(&req) {
+            // Server-side dry-run admission requests are admitted without
+            // writing anything, but annotated with an overlay evaluation of the
+            // candidate ServerAuthorization against the live index.
+            if req.dry_run {
+                return self.admit_server_authorization_dry_run(req).await;
+            }
             return self.admit_spec::<ServerAuthorizationSpec>(req).await;
         };
 
@@ -206,6 +273,56 @@ impl Admission {
 
         rsp
     }
+
+    /// Validates a server-side dry-run `ServerAuthorization` request and, when
+    /// the spec is valid, overlays the candidate resource onto the live index
+    /// to report which servers it would select and which identities it would
+    /// require. The candidate is never written to Kubernetes.
+    async fn admit_server_authorization_dry_run(self, req: AdmissionRequest) -> AdmissionResponse {
+        let rsp = AdmissionResponse::from(&req);
+
+        let (obj, spec) = match parse_spec::<ServerAuthorizationSpec>(req) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                info!(%error, "Failed to parse ServerAuthorization spec");
+                return rsp.deny(error);
+            }
+        };
+
+        let ns = obj.namespace().unwrap_or_default();
+        let name = obj.name_any();
+        let annotations = obj.annotations();
+        // `validate` takes `self` by value, so validate a clone and keep the
+        // index handle for the overlay evaluation below.
+        if let Err(error) = self.clone().validate(&ns, &name, annotations, spec).await {
+            info!(%error, %ns, %name, "Denied dry-run ServerAuthorization");
+            return rsp.deny(error);
+        }
+
+        // Re-deserialize the dynamic object into a typed
+        // ServerAuthorization so it can be overlaid on the index.
+        let candidate = match serde_json::to_value(&obj)
+            .and_then(serde_json::from_value::<ServerAuthorization>)
+        {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                warn!(%error, "Failed to read dry-run ServerAuthorization object");
+                return rsp.deny(anyhow!("failed to read ServerAuthorization: {error}"));
+            }
+        };
+
+        match self.index.read().preview_server_authorization(candidate) {
+            Ok(preview) => {
+                let mut rsp = rsp;
+                rsp.warnings = Some(preview_warnings(&preview));
+                rsp
+            }
+            Err(error) => {
+                info!(%error, %ns, %name, "Dry-run ServerAuthorization evaluation failed");
+                rsp.deny(anyhow!("dry-run evaluation failed: {error}"))
+            }
+        }
+    }
 }
 
 fn is_kind<T>(req: &AdmissionRequest) -> bool
@@ -225,6 +342,82 @@ fn json_response(rsp: AdmissionReview) -> Result<Response<Body>, Error> {
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(Body::from(bytes))
         .expect("admission review response must be valid"))
+}
+
+fn json_error_response(
+    status: http::StatusCode,
+    message: &str,
+) -> std::result::Result<Response<Body>, Error> {
+    let bytes = serde_json::to_vec(&serde_json::json!({ "error": message }))?;
+    Ok(Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .expect("error response must be valid"))
+}
+
+/// Kubernetes truncates admission warnings beyond this length, so keep each
+/// warning within it.
+const WARNING_MAX_LEN: usize = 256;
+
+/// Formats the dry-run preview of a candidate `ServerAuthorization` as
+/// admission warnings describing the servers it would select and the identity
+/// requirements it would impose. No object is persisted.
+fn preview_warnings(preview: &index::inbound::ServerAuthorizationPreview) -> Vec<String> {
+    fn truncate(message: String) -> String {
+        if message.len() <= WARNING_MAX_LEN {
+            return message;
+        }
+        let mut truncated = message;
+        truncated.truncate(WARNING_MAX_LEN - 3);
+        truncated.push_str("...");
+        truncated
+    }
+
+    let mut warnings = Vec::new();
+
+    if preview.selected_servers.is_empty() {
+        warnings.push(truncate(format!(
+            "dry-run: ServerAuthorization \"{}\" selects no live Server in namespace \"{}\" at \
+             index resourceVersion {}; existing policies for the affected ports are unchanged",
+            preview.name, preview.namespace, preview.resource_version,
+        )));
+    } else {
+        let names = preview
+            .selected_servers
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(truncate(format!(
+            "dry-run: ServerAuthorization \"{}\" would select {} Server(s) [{names}] at index \
+             resourceVersion {}",
+            preview.name,
+            preview.selected_servers.len(),
+            preview.resource_version,
+        )));
+    }
+
+    let networks = if preview.networks.is_empty() {
+        "the cluster networks".to_string()
+    } else {
+        preview.networks.join(", ")
+    };
+    match preview.authentication.as_str() {
+        "meshtls" => warnings.push(truncate(format!(
+            "dry-run: requires mesh identity: {} (source networks: {networks})",
+            preview.identities.join(", ")
+        ))),
+        "unauthenticated-tls" => warnings.push(truncate(format!(
+            "dry-run: requires mesh TLS without a workload identity (ingress mode) from \
+             {networks}"
+        ))),
+        _ => warnings.push(truncate(format!(
+            "dry-run: permits unauthenticated clients from {networks}"
+        ))),
+    }
+
+    warnings
 }
 
 fn parse_spec<T: DeserializeOwned>(req: AdmissionRequest) -> Result<(DynamicObject, T)> {
@@ -877,5 +1070,85 @@ impl Validate<RateLimitPolicySpec> for Admission {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IDENTITY: &str = "web.ns-0.serviceaccount.identity.linkerd.cluster.example.com";
+
+    fn preview(
+        authentication: &str,
+        identities: Vec<String>,
+        networks: Vec<String>,
+        selected_servers: Vec<index::inbound::SelectedServer>,
+    ) -> index::inbound::ServerAuthorizationPreview {
+        index::inbound::ServerAuthorizationPreview {
+            resource_version: 7,
+            namespace: "ns-0".to_string(),
+            name: "authz-web".to_string(),
+            candidate_resource_version: None,
+            authentication: authentication.to_string(),
+            identities,
+            networks,
+            selected_servers,
+        }
+    }
+
+    fn selected_server() -> index::inbound::SelectedServer {
+        index::inbound::SelectedServer {
+            name: "srv-8080".to_string(),
+            resource_version: Some("100".to_string()),
+            port: "8080".to_string(),
+            protocol: "HTTP/1".to_string(),
+        }
+    }
+
+    #[test]
+    fn warnings_describe_matching_servers_and_required_identity() {
+        let preview = preview(
+            "meshtls",
+            vec![IDENTITY.to_string()],
+            vec!["10.0.0.0/8".to_string()],
+            vec![selected_server()],
+        );
+        let warnings = preview_warnings(&preview);
+
+        assert_eq!(warnings.len(), 2);
+        let joined = warnings.join("\n");
+        assert!(joined.contains("would select 1 Server(s) [srv-8080]"));
+        assert!(joined.contains("index resourceVersion 7"));
+        assert!(joined.contains(IDENTITY));
+        assert!(joined.contains("10.0.0.0/8"));
+        for warning in warnings {
+            assert!(warning.len() <= WARNING_MAX_LEN);
+        }
+    }
+
+    #[test]
+    fn warnings_for_unmatched_selector_and_unauthenticated_clients() {
+        let preview = preview("unauthenticated", vec![], vec![], vec![]);
+        let warnings = preview_warnings(&preview);
+
+        assert_eq!(warnings.len(), 2);
+        let joined = warnings.join("\n");
+        assert!(joined.contains("selects no live Server in namespace \"ns-0\""));
+        assert!(joined.contains("permits unauthenticated clients from the cluster networks"));
+    }
+
+    #[test]
+    fn warnings_describe_ingress_unauthenticated_tls() {
+        let preview = preview(
+            "unauthenticated-tls",
+            vec![],
+            vec!["0.0.0.0/0".to_string()],
+            vec![selected_server()],
+        );
+        let warnings = preview_warnings(&preview);
+        assert!(warnings
+            .join("\n")
+            .contains("requires mesh TLS without a workload identity (ingress mode)"));
     }
 }

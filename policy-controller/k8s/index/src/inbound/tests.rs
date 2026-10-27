@@ -1,5 +1,6 @@
 mod annotation;
 mod authorization_policy;
+mod dry_run;
 mod grpc_routes;
 mod http_routes;
 mod meshtls_authentication;

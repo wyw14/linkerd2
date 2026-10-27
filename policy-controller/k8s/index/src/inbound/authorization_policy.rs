@@ -10,6 +10,11 @@ use linkerd_policy_controller_k8s_api::{
 pub(crate) struct Spec {
     pub target: Target,
     pub authentications: Vec<AuthenticationTarget>,
+
+    /// The Kubernetes `metadata.resourceVersion` of the resource from which
+    /// this policy was indexed. This is reported by dry-run evaluations so that
+    /// callers can attribute a policy decision to an exact object version.
+    pub resource_version: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -57,6 +62,7 @@ impl TryFrom<k8s::policy::AuthorizationPolicySpec> for Spec {
         Ok(Self {
             target,
             authentications,
+            resource_version: None,
         })
     }
 }

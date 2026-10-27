@@ -11,6 +11,12 @@ use linkerd_policy_controller_k8s_api::{self as k8s, policy::server_authorizatio
 pub(crate) struct ServerAuthz {
     pub authz: ClientAuthorization,
     pub server_selector: ServerSelector,
+
+    /// The Kubernetes `metadata.resourceVersion` of the resource from which
+    /// this authorization was indexed. This is reported by dry-run evaluations
+    /// so that callers can attribute a policy decision to an exact object
+    /// version.
+    pub resource_version: Option<String>,
 }
 
 /// Selects `Server`s for a `ServerAuthoriation`
@@ -25,6 +31,7 @@ impl ServerAuthz {
         saz: k8s::policy::ServerAuthorization,
         cluster: &ClusterInfo,
     ) -> Result<Self> {
+        let resource_version = saz.metadata.resource_version;
         let authz = {
             let namespace = saz
                 .metadata
@@ -37,6 +44,7 @@ impl ServerAuthz {
         Ok(Self {
             authz,
             server_selector,
+            resource_version,
         })
     }
 }

@@ -13,10 +13,16 @@ pub(crate) struct Server {
     pub protocol: ProxyProtocol,
     pub access_policy: Option<DefaultPolicy>,
     pub created_at: Option<k8s::Time>,
+
+    /// The Kubernetes `metadata.resourceVersion` of the resource from which
+    /// this server was indexed. This is reported by dry-run evaluations so that
+    /// callers can attribute a policy decision to an exact object version.
+    pub resource_version: Option<String>,
 }
 
 impl Server {
     pub(crate) fn from_resource(srv: k8s::policy::Server, cluster: &ClusterInfo) -> Self {
+        let resource_version = srv.metadata.resource_version;
         Self {
             labels: srv.metadata.labels.into(),
             selector: srv.spec.selector,
@@ -24,6 +30,7 @@ impl Server {
             protocol: proxy_protocol(srv.spec.proxy_protocol, cluster),
             access_policy: srv.spec.access_policy.and_then(|p| p.parse().ok()),
             created_at: srv.metadata.creation_timestamp,
+            resource_version,
         }
     }
 }

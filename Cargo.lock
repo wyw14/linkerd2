@@ -1370,6 +1370,7 @@ dependencies = [
  "maplit",
  "parking_lot",
  "prometheus-client",
+ "serde",
  "thiserror",
  "tokio",
  "tokio-stream",

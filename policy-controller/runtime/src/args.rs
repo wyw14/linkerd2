@@ -426,6 +426,12 @@ impl Args {
                 .instrument(info_span!("status_index")),
         );
 
+        // The admission webhook performs read-only dry-run authorization
+        // evaluations against the live inbound index; it never writes policy
+        // objects itself. Clone the handle before the gRPC server takes
+        // ownership of the index.
+        let admission_index = inbound_index.clone();
+
         // Run the gRPC server, serving results by looking up against the index handle.
         tokio::spawn(grpc(
             grpc_addr,
@@ -454,7 +460,7 @@ impl Args {
                 .instrument(info_span!("status_controller")),
         );
 
-        let runtime = runtime.spawn_server(Admission::new);
+        let runtime = runtime.spawn_server(move || Admission::new(admission_index.clone()));
 
         // Run until the shutdown signal fires or the lease task ends unexpectedly.
         // Consumers of `claims` panic if the lease watch is ever dropped, on the

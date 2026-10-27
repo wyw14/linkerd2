@@ -40,9 +40,15 @@ use std::{
 use tokio::sync::watch;
 use tracing::info_span;
 
+pub(crate) mod dry_run;
 mod grpc;
 mod http;
 pub mod metrics;
+
+pub use self::dry_run::{
+    DryRunClient, DryRunDecision, DryRunError, DryRunRequest, DryRunResponse, MatchedAuthorization,
+    MatchedServer, SelectedServer, ServerAuthorizationPreview,
+};
 
 pub type SharedIndex = Arc<RwLock<Index>>;
 
@@ -54,6 +60,15 @@ pub struct Index {
     cluster_info: Arc<ClusterInfo>,
     namespaces: NamespaceIndex,
     authentications: AuthenticationNsIndex,
+
+    /// A monotonic counter bumped each time the indexed state changes.
+    ///
+    /// Read-only lookups (e.g. dry-run evaluations) report this value as the
+    /// evaluation's `resourceVersion`. Because an evaluation runs while holding
+    /// a single read lock, every policy referenced by its response is observed
+    /// at this exact revision; concurrent updates can never cause a response to
+    /// mix policies from different revisions.
+    revision: u64,
 }
 
 /// Holds all `Pod`, `Server`, and `ServerAuthorization` indices by-namespace.
@@ -192,7 +207,21 @@ impl Index {
                 by_ns: HashMap::default(),
             },
             authentications: AuthenticationNsIndex::default(),
+            revision: 0,
         }))
+    }
+
+    /// Returns the index's current revision, i.e. the resourceVersion of its
+    /// current state. The value is monotonically increased as watch events
+    /// change indexed state.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Records a state change, bumping the resourceVersion.
+    #[inline]
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Obtains a pod:port's server receiver.
@@ -248,8 +277,12 @@ impl Index {
     }
 
     fn ns_with_reindex(&mut self, namespace: String, f: impl FnOnce(&mut Namespace) -> bool) {
-        self.namespaces
+        if self
+            .namespaces
             .get_with_reindex(namespace, &self.authentications, f)
+        {
+            self.bump_revision();
+        }
     }
 
     fn ns_or_default_with_reindex(
@@ -257,8 +290,12 @@ impl Index {
         namespace: String,
         f: impl FnOnce(&mut Namespace) -> bool,
     ) {
-        self.namespaces
+        if self
+            .namespaces
             .get_or_default_with_reindex(namespace, &self.authentications, f)
+        {
+            self.bump_revision();
+        }
     }
 
     fn reindex_all(&mut self) {
@@ -472,13 +509,20 @@ impl kubert::index::IndexNamespacedResource<k8s::Pod> for Index {
         // Add or update the pod. If the pod was not already present in the
         // index with the same metadata, index it against the policy resources,
         // updating its watches.
+        let mut changed = false;
         let ns = self.namespaces.get_or_default(namespace);
         match ns.pods.update(name, meta, port_names, probes) {
             Ok(None) => {}
-            Ok(Some(pod)) => pod.reindex_servers(&ns.policy, &self.authentications),
+            Ok(Some(pod)) => {
+                pod.reindex_servers(&ns.policy, &self.authentications);
+                changed = true;
+            }
             Err(error) => {
                 tracing::warn!(%error, "Illegal pod update");
             }
+        }
+        if changed {
+            self.bump_revision();
         }
     }
 
@@ -488,9 +532,12 @@ impl kubert::index::IndexNamespacedResource<k8s::Pod> for Index {
             // Once the pod is removed, there's nothing else to update. Any open
             // watches will complete.  No other parts of the index need to be
             // updated.
-            if ns.get_mut().pods.by_name.remove(&name).is_some() && ns.get().is_empty() {
-                tracing::debug!(namespace = ns.key(), "Removing empty namespace index");
-                ns.remove();
+            if ns.get_mut().pods.by_name.remove(&name).is_some() {
+                if ns.get().is_empty() {
+                    tracing::debug!(namespace = ns.key(), "Removing empty namespace index");
+                    ns.remove();
+                }
+                self.bump_revision();
             }
         }
     }
@@ -515,15 +562,22 @@ impl kubert::index::IndexNamespacedResource<k8s::external_workload::ExternalWork
         //
         // If the resource is present in the index, but its metadata has
         // changed, then it means the watches need to get an update.
+        let mut changed = false;
         let ns = self.namespaces.get_or_default(ns);
         match ns.external_workloads.update(name, meta, port_names) {
             // No update
             Ok(None) => {}
             // Update, so re-index
-            Ok(Some(workload)) => workload.reindex_servers(&ns.policy, &self.authentications),
+            Ok(Some(workload)) => {
+                workload.reindex_servers(&ns.policy, &self.authentications);
+                changed = true;
+            }
             Err(error) => {
                 tracing::warn!(%error, "Illegal external workload update");
             }
+        }
+        if changed {
+            self.bump_revision();
         }
     }
 
@@ -539,9 +593,11 @@ impl kubert::index::IndexNamespacedResource<k8s::external_workload::ExternalWork
                 .by_name
                 .remove(&name)
                 .is_some()
-                && ns.get().is_empty()
             {
-                ns.remove();
+                if ns.get().is_empty() {
+                    ns.remove();
+                }
+                self.bump_revision();
             }
         }
     }
@@ -702,13 +758,14 @@ impl kubert::index::IndexNamespacedResource<k8s::policy::AuthorizationPolicy> fo
         let name = policy.name_unchecked();
         let _span = info_span!("apply", %ns, saz = %name).entered();
 
-        let spec = match authorization_policy::Spec::try_from(policy.spec) {
+        let mut spec = match authorization_policy::Spec::try_from(policy.spec) {
             Ok(spec) => spec,
             Err(error) => {
                 tracing::warn!(%error, "Invalid authorization policy");
                 return;
             }
         };
+        spec.resource_version = policy.metadata.resource_version;
 
         self.ns_or_default_with_reindex(ns, |ns| ns.policy.update_authz_policy(name, spec))
     }
@@ -739,11 +796,14 @@ impl kubert::index::IndexNamespacedResource<k8s::policy::AuthorizationPolicy> fo
                 .expect("authorizationpolicy must be namespaced");
             let name = policy.name_unchecked();
             match authorization_policy::Spec::try_from(policy.spec) {
-                Ok(spec) => updates_by_ns
-                    .entry(namespace)
-                    .or_default()
-                    .added
-                    .push((name, spec)),
+                Ok(mut spec) => {
+                    spec.resource_version = policy.metadata.resource_version;
+                    updates_by_ns
+                        .entry(namespace)
+                        .or_default()
+                        .added
+                        .push((name, spec))
+                }
                 Err(error) => {
                     tracing::warn!(ns = %namespace, %name, %error, "Illegal server authorization update")
                 }
@@ -801,6 +861,7 @@ impl kubert::index::IndexNamespacedResource<k8s::policy::MeshTLSAuthentication> 
 
         if self.authentications.update_meshtls(ns, name, spec) {
             self.reindex_all();
+            self.bump_revision();
         }
     }
 
@@ -809,11 +870,13 @@ impl kubert::index::IndexNamespacedResource<k8s::policy::MeshTLSAuthentication> 
 
         if let Entry::Occupied(mut ns) = self.authentications.by_ns.entry(ns) {
             tracing::debug!("Deleting MeshTLSAuthentication");
-            ns.get_mut().meshtls.remove(&name);
-            if ns.get().is_empty() {
-                ns.remove();
+            if ns.get_mut().meshtls.remove(&name).is_some() {
+                if ns.get().is_empty() {
+                    ns.remove();
+                }
+                self.reindex_all();
+                self.bump_revision();
             }
-            self.reindex_all();
         } else {
             tracing::warn!("Namespace already deleted!");
         }
@@ -860,6 +923,7 @@ impl kubert::index::IndexNamespacedResource<k8s::policy::MeshTLSAuthentication> 
 
         if changed {
             self.reindex_all();
+            self.bump_revision();
         }
     }
 }
@@ -880,6 +944,7 @@ impl kubert::index::IndexNamespacedResource<k8s::policy::NetworkAuthentication> 
 
         if self.authentications.update_network(ns, name, spec) {
             self.reindex_all();
+            self.bump_revision();
         }
     }
 
@@ -889,11 +954,13 @@ impl kubert::index::IndexNamespacedResource<k8s::policy::NetworkAuthentication> 
         if let Entry::Occupied(mut ns) = self.authentications.by_ns.entry(ns) {
             tracing::debug!("Deleting NetworkAuthentication");
 
-            ns.get_mut().network.remove(&name);
-            if ns.get().is_empty() {
-                ns.remove();
+            if ns.get_mut().network.remove(&name).is_some() {
+                if ns.get().is_empty() {
+                    ns.remove();
+                }
+                self.reindex_all();
+                self.bump_revision();
             }
-            self.reindex_all();
         } else {
             tracing::warn!("Namespace already deleted!");
         }
@@ -937,6 +1004,7 @@ impl kubert::index::IndexNamespacedResource<k8s::policy::NetworkAuthentication> 
 
         if changed {
             self.reindex_all();
+            self.bump_revision();
         }
     }
 }
@@ -1095,12 +1163,15 @@ impl NamespaceIndex {
     /// function. If the function returns true, all pods in the namespace are
     /// reindexed; or, if the function returns false and the namespace is empty,
     /// it is removed from the index.
+    ///
+    /// Returns true when the indexed state changed (and the index revision must
+    /// be bumped).
     fn get_with_reindex(
         &mut self,
         namespace: String,
         authns: &AuthenticationNsIndex,
         f: impl FnOnce(&mut Namespace) -> bool,
-    ) {
+    ) -> bool {
         if let Entry::Occupied(mut ns) = self.by_ns.entry(namespace) {
             if f(ns.get_mut()) {
                 if ns.get().is_empty() {
@@ -1109,23 +1180,33 @@ impl NamespaceIndex {
                 } else {
                     ns.get_mut().reindex(authns);
                 }
+                return true;
             }
         }
+        false
     }
 
     /// Gets the given namespace (or creates it) and passes it to the given
     /// function. If the function returns true, all pods in the namespace are
     /// reindexed.
+    ///
+    /// Returns true when the indexed state changed (and the index revision must
+    /// be bumped).
     fn get_or_default_with_reindex(
         &mut self,
         namespace: String,
         authns: &AuthenticationNsIndex,
         f: impl FnOnce(&mut Namespace) -> bool,
-    ) {
+    ) -> bool {
+        let existed = self.by_ns.contains_key(&namespace);
         let ns = self.get_or_default(namespace);
-        if f(ns) {
+        let changed = f(ns);
+        if changed {
             ns.reindex(authns);
         }
+        // A namespace was created to hold the resource, even if the update was
+        // otherwise a no-op.
+        changed || !existed
     }
 }
 
