@@ -68,6 +68,24 @@ type ServiceStatus struct {
 	Conditions     []LinkCondition `json:"conditions,omitempty"`
 	ControllerName string          `json:"controllerName,omitempty"`
 	RemoteRef      ObjectRef       `json:"remoteRef,omitempty"`
+	// ImportedVersion is the resource version of the remote Service that was
+	// mirrored most recently. It is sourced from the remote Service's
+	// metadata.resourceVersion at the time it was imported.
+	// +optional
+	ImportedVersion string `json:"importedVersion,omitempty"`
+	// Endpoints is the number of ready endpoint addresses currently exposed
+	// by the local mirror Service.
+	// +optional
+	Endpoints int32 `json:"endpoints,omitempty"`
+	// LastError is the last error encountered while reconciling the mirror.
+	// It is reset to the empty string once reconciliation succeeds.
+	// +optional
+	LastError string `json:"lastError,omitempty"`
+	// RetryTimestamp is the time at which the service mirror will next retry
+	// reconciling a mirror that failed. It is unset when the mirror is
+	// healthy or when retries have been exhausted.
+	// +optional
+	RetryTimestamp *metav1.Time `json:"retryTimestamp,omitempty"`
 }
 
 // LinkCondition represents the service state of an ExternalWorkload

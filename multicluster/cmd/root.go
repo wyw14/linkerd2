@@ -91,6 +91,7 @@ components on a cluster, manage credentials and link clusters together.`,
 	multiclusterCmd.AddCommand(NewCmdCheck())
 	multiclusterCmd.AddCommand(newMulticlusterUninstallCommand())
 	multiclusterCmd.AddCommand(newGatewaysCommand())
+	multiclusterCmd.AddCommand(newStatusCommand())
 	multiclusterCmd.AddCommand(newAllowCommand())
 
 	// resource-aware completion flag configurations

@@ -225,6 +225,11 @@ func (in *ServiceStatus) DeepCopyInto(out *ServiceStatus) {
 		}
 	}
 	out.RemoteRef = in.RemoteRef
+	if in.RetryTimestamp != nil {
+		in, out := &in.RetryTimestamp, &out.RetryTimestamp
+		*out = new(v1.Time)
+		(*in).DeepCopyInto(*out)
+	}
 	return
 }
 

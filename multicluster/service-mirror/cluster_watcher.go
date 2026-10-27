@@ -37,6 +37,10 @@ const (
 	reasonInvalidService   = "InvalidService"
 	reasonError            = "Error"
 	reasonMissingNamespace = "MissingNamespace"
+
+	// serviceMirrorControllerName is the controller name reported in the
+	// ServiceStatus entries written to Link resources.
+	serviceMirrorControllerName = "linkerd.io/service-mirror"
 )
 
 type (
@@ -59,6 +63,7 @@ type (
 		recorder                 record.EventRecorder
 		log                      *logging.Entry
 		eventsQueue              workqueue.TypedRateLimitingInterface[any]
+		rateLimiter              workqueue.TypedRateLimiter[any]
 		requeueLimit             int
 		repairPeriod             time.Duration
 		gatewayAlive             atomic.Bool
@@ -217,6 +222,7 @@ func NewRemoteClusterServiceWatcher(
 	})
 
 	stopper := make(chan struct{})
+	rateLimiter := workqueue.DefaultTypedControllerRateLimiter[any]()
 	rcsw := &RemoteClusterServiceWatcher{
 		serviceMirrorNamespace: serviceMirrorNamespace,
 		link:                   link,
@@ -230,7 +236,8 @@ func NewRemoteClusterServiceWatcher(
 		log: logging.WithFields(logging.Fields{
 			"cluster": link.Spec.TargetClusterName,
 		}),
-		eventsQueue:              workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[any]()),
+		eventsQueue:              workqueue.NewTypedRateLimitingQueue(rateLimiter),
+		rateLimiter:              rateLimiter,
 		requeueLimit:             requeueLimit,
 		repairPeriod:             repairPeriod,
 		liveness:                 liveness,
@@ -1363,9 +1370,14 @@ func (rcsw *RemoteClusterServiceWatcher) processEvents(ctx context.Context) {
 				if (rcsw.eventsQueue.NumRequeues(event) < rcsw.requeueLimit) && !done {
 					rcsw.log.Errorf("Error processing %s (will retry): %s", event, re)
 					rcsw.eventsQueue.AddRateLimited(event)
+					// Record the failure and the time at which the event will
+					// be retried; must happen after AddRateLimited so that the
+					// rate limiter can report the backoff delay.
+					rcsw.recordMirrorEventFailure(event, re, true)
 				} else {
 					rcsw.log.Errorf("Error processing %s (giving up): %s", event, re)
 					rcsw.eventsQueue.Forget(event)
+					rcsw.recordMirrorEventFailure(event, re, false)
 				}
 			} else {
 				rcsw.log.Errorf("Error processing %s (will not retry): %s", event, err)
@@ -1876,7 +1888,43 @@ func (rcsw *RemoteClusterServiceWatcher) updateLinkMirrorStatus(remoteName, name
 		rcsw.log.Errorf("Failed to get link %s/%s: %s", rcsw.link.Namespace, rcsw.link.Name, err)
 		return
 	}
-	link.Status.MirrorServices = updateServiceStatus(remoteName, namespace, condition, link.Status.MirrorServices)
+
+	status := v1alpha3.ServiceStatus{
+		ControllerName: serviceMirrorControllerName,
+		RemoteRef:      serviceObjectRef(remoteName, namespace),
+		Conditions:     []v1alpha3.LinkCondition{condition},
+	}
+
+	// Populate the imported remote resource version and the current number of
+	// ready mirror endpoints from the local mirror resources.
+	mirrorName := rcsw.mirrorServiceName(remoteName)
+	importedVersion, endpoints, found := rcsw.mirrorImportState(namespace, mirrorName)
+	if found {
+		status.ImportedVersion = importedVersion
+		status.Endpoints = endpoints
+	}
+
+	if condition.Status == metav1.ConditionTrue {
+		// A successful reconcile clears any previously recorded error and
+		// pending retry.
+		status.LastError = ""
+		status.RetryTimestamp = nil
+	} else {
+		status.LastError = condition.Message
+		// Preserve the last known import state and the pending retry of a
+		// previous status entry in case the mirror resources are unreadable.
+		if previous := getServiceStatus(remoteName, namespace, link.Status.MirrorServices); previous != nil {
+			if status.ImportedVersion == "" {
+				status.ImportedVersion = previous.ImportedVersion
+			}
+			if !found {
+				status.Endpoints = previous.Endpoints
+			}
+			status.RetryTimestamp = previous.RetryTimestamp
+		}
+	}
+
+	link.Status.MirrorServices = updateServiceStatus(status, link.Status.MirrorServices)
 	rcsw.patchLinkStatus(link.Status)
 }
 
@@ -1888,8 +1936,33 @@ func (rcsw *RemoteClusterServiceWatcher) updateLinkFederatedStatus(remoteName, n
 	link, err := rcsw.linksAPIClient.L5dClient.LinkV1alpha3().Links(rcsw.link.GetNamespace()).Get(context.Background(), rcsw.link.Name, metav1.GetOptions{})
 	if err != nil {
 		rcsw.log.Errorf("Failed to get link %s/%s: %s", rcsw.link.Namespace, rcsw.link.Name, err)
+		return
 	}
-	link.Status.FederatedServices = updateServiceStatus(remoteName, namespace, condition, link.Status.FederatedServices)
+
+	status := v1alpha3.ServiceStatus{
+		ControllerName: serviceMirrorControllerName,
+		RemoteRef:      serviceObjectRef(remoteName, namespace),
+		Conditions:     []v1alpha3.LinkCondition{condition},
+	}
+	_, endpoints, found := rcsw.mirrorImportState(namespace, rcsw.federatedServiceName(remoteName))
+	if found {
+		status.Endpoints = endpoints
+	}
+	if condition.Status == metav1.ConditionTrue {
+		status.LastError = ""
+		status.RetryTimestamp = nil
+	} else {
+		status.LastError = condition.Message
+		if previous := getServiceStatus(remoteName, namespace, link.Status.FederatedServices); previous != nil {
+			status.ImportedVersion = previous.ImportedVersion
+			if !found {
+				status.Endpoints = previous.Endpoints
+			}
+			status.RetryTimestamp = previous.RetryTimestamp
+		}
+	}
+
+	link.Status.FederatedServices = updateServiceStatus(status, link.Status.FederatedServices)
 	rcsw.patchLinkStatus(link.Status)
 }
 
@@ -1901,6 +1974,7 @@ func (rcsw *RemoteClusterServiceWatcher) deleteLinkMirrorStatus(remoteName, name
 	link, err := rcsw.linksAPIClient.L5dClient.LinkV1alpha3().Links(rcsw.link.GetNamespace()).Get(context.Background(), rcsw.link.Name, metav1.GetOptions{})
 	if err != nil {
 		rcsw.log.Errorf("Failed to get link %s/%s: %s", rcsw.link.Namespace, rcsw.link.Name, err)
+		return
 	}
 	link.Status.MirrorServices = deleteServiceStatus(remoteName, namespace, link.Status.MirrorServices)
 	rcsw.patchLinkStatus(link.Status)
@@ -1914,9 +1988,114 @@ func (rcsw *RemoteClusterServiceWatcher) deleteLinkFederatedStatus(remoteName, n
 	link, err := rcsw.linksAPIClient.L5dClient.LinkV1alpha3().Links(rcsw.link.GetNamespace()).Get(context.Background(), rcsw.link.Name, metav1.GetOptions{})
 	if err != nil {
 		rcsw.log.Errorf("Failed to get link %s/%s: %s", rcsw.link.Namespace, rcsw.link.Name, err)
+		return
 	}
 	link.Status.FederatedServices = deleteServiceStatus(remoteName, namespace, link.Status.FederatedServices)
 	rcsw.patchLinkStatus(link.Status)
+}
+
+// mirrorImportState returns the remote resource version that was last imported
+// for the named local mirror service and the number of ready endpoint
+// addresses currently exposed by it. found reports whether the local mirror
+// service exists. The informer cache is consulted first and, when the service
+// has just been created and is not cached yet, the live API is used as a
+// fallback so that freshly mirrored services are reported immediately.
+func (rcsw *RemoteClusterServiceWatcher) mirrorImportState(namespace, name string) (importedVersion string, endpoints int32, found bool) {
+	service, err := rcsw.localAPIClient.Svc().Lister().Services(namespace).Get(name)
+	if err != nil {
+		if !kerrors.IsNotFound(err) {
+			return "", 0, false
+		}
+		service, err = rcsw.localAPIClient.Client.CoreV1().Services(namespace).Get(context.Background(), name, metav1.GetOptions{})
+		if err != nil {
+			return "", 0, false
+		}
+	}
+	importedVersion = service.Annotations[consts.RemoteResourceVersionAnnotation]
+	ep, err := rcsw.localAPIClient.Endpoint().Lister().Endpoints(namespace).Get(name)
+	if err != nil && kerrors.IsNotFound(err) {
+		ep, err = rcsw.localAPIClient.Client.CoreV1().Endpoints(namespace).Get(context.Background(), name, metav1.GetOptions{})
+	}
+	if err == nil {
+		for _, subset := range ep.Subsets {
+			endpoints += int32(len(subset.Addresses))
+		}
+	}
+	return importedVersion, endpoints, true
+}
+
+// recordMirrorEventFailure records the last error incurred while reconciling a
+// mirrored service and, when willRetry is true, the time at which the rate
+// limited event is scheduled to be retried. When willRetry is false the
+// retries have been exhausted and the retry timestamp is cleared. The method
+// must be invoked after the event has been re-queued with AddRateLimited as
+// the backoff delay is read from the work queue.
+func (rcsw *RemoteClusterServiceWatcher) recordMirrorEventFailure(event interface{}, reconcileErr error, willRetry bool) {
+	if rcsw.link.Spec.TargetClusterName == "" {
+		// The local cluster has no Link resource.
+		return
+	}
+	remoteName, namespace, ok := remoteMirrorServiceRef(event)
+	if !ok {
+		// The event is not tied to a single mirrored service, so its
+		// failure cannot be recorded against a ServiceStatus entry.
+		return
+	}
+	link, err := rcsw.linksAPIClient.L5dClient.LinkV1alpha3().Links(rcsw.link.GetNamespace()).Get(context.Background(), rcsw.link.Name, metav1.GetOptions{})
+	if err != nil {
+		rcsw.log.Errorf("Failed to get link %s/%s: %s", rcsw.link.Namespace, rcsw.link.Name, err)
+		return
+	}
+
+	status := getServiceStatus(remoteName, namespace, link.Status.MirrorServices)
+	if status == nil {
+		status = &v1alpha3.ServiceStatus{
+			ControllerName: serviceMirrorControllerName,
+			RemoteRef:      serviceObjectRef(remoteName, namespace),
+			Conditions: []v1alpha3.LinkCondition{
+				mirrorStatusCondition(false, reasonError, reconcileErr.Error(), nil),
+			},
+		}
+	}
+	status.LastError = reconcileErr.Error()
+	if willRetry {
+		var retryTimestamp metav1.Time
+		if rcsw.rateLimiter != nil {
+			retryTimestamp = metav1.NewTime(time.Now().Add(rcsw.rateLimiter.When(event)))
+		} else {
+			retryTimestamp = metav1.Now()
+		}
+		status.RetryTimestamp = &retryTimestamp
+	} else {
+		status.RetryTimestamp = nil
+	}
+	link.Status.MirrorServices = updateServiceStatus(*status, link.Status.MirrorServices)
+	rcsw.patchLinkStatus(link.Status)
+}
+
+// remoteMirrorServiceRef maps a service mirror event to the namespace/name of
+// the remote service it reconciles. ok is false for events which are not tied
+// to a single mirrored service.
+func remoteMirrorServiceRef(event interface{}) (name, namespace string, ok bool) {
+	switch ev := event.(type) {
+	case *OnAddCalled:
+		return ev.svc.Name, ev.svc.Namespace, true
+	case *OnUpdateCalled:
+		return ev.svc.Name, ev.svc.Namespace, true
+	case *OnDeleteCalled:
+		return ev.svc.Name, ev.svc.Namespace, true
+	case *RemoteServiceExported:
+		return ev.service.Name, ev.service.Namespace, true
+	case *RemoteExportedServiceUpdated:
+		return ev.remoteUpdate.Name, ev.remoteUpdate.Namespace, true
+	case *RemoteServiceUnexported:
+		return ev.Name, ev.Namespace, true
+	case *OnAddEndpointsCalled:
+		return ev.ep.Name, ev.ep.Namespace, true
+	case *OnUpdateEndpointsCalled:
+		return ev.ep.Name, ev.ep.Namespace, true
+	}
+	return "", "", false
 }
 
 func (rcsw *RemoteClusterServiceWatcher) patchLinkStatus(status v1alpha3.LinkStatus) {
@@ -1938,28 +2117,23 @@ func (rcsw *RemoteClusterServiceWatcher) patchLinkStatus(status v1alpha3.LinkSta
 	}
 }
 
-func updateServiceStatus(remoteName, namespace string, condition v1alpha3.LinkCondition, statuses []v1alpha3.ServiceStatus) []v1alpha3.ServiceStatus {
-	foundStatus := false
-	for i, status := range statuses {
-		if status.RemoteRef.Name == remoteName && status.RemoteRef.Namespace == namespace {
-			foundStatus = true
-			status.Conditions = []v1alpha3.LinkCondition{condition}
+func updateServiceStatus(status v1alpha3.ServiceStatus, statuses []v1alpha3.ServiceStatus) []v1alpha3.ServiceStatus {
+	for i, existing := range statuses {
+		if existing.RemoteRef.Name == status.RemoteRef.Name && existing.RemoteRef.Namespace == status.RemoteRef.Namespace {
 			statuses[i] = status
+			return statuses
 		}
 	}
-	if !foundStatus {
-		statuses = append(statuses, v1alpha3.ServiceStatus{
-			ControllerName: "linkerd.io/service-mirror",
-			RemoteRef: v1alpha3.ObjectRef{
-				Name:      remoteName,
-				Namespace: namespace,
-				Kind:      "Service",
-				Group:     corev1.GroupName,
-			},
-			Conditions: []v1alpha3.LinkCondition{condition},
-		})
+	return append(statuses, status)
+}
+
+func getServiceStatus(remoteName, namespace string, statuses []v1alpha3.ServiceStatus) *v1alpha3.ServiceStatus {
+	for i := range statuses {
+		if statuses[i].RemoteRef.Name == remoteName && statuses[i].RemoteRef.Namespace == namespace {
+			return &statuses[i]
+		}
 	}
-	return statuses
+	return nil
 }
 
 func deleteServiceStatus(remoteName, namespace string, statuses []v1alpha3.ServiceStatus) []v1alpha3.ServiceStatus {
@@ -1973,13 +2147,24 @@ func deleteServiceStatus(remoteName, namespace string, statuses []v1alpha3.Servi
 	return newStatuses
 }
 
+func serviceObjectRef(name, namespace string) v1alpha3.ObjectRef {
+	return v1alpha3.ObjectRef{
+		Name:      name,
+		Namespace: namespace,
+		Kind:      "Service",
+		Group:     corev1.GroupName,
+	}
+}
+
 func mirrorStatusCondition(success bool, reason string, message string, localRef *corev1.Service) v1alpha3.LinkCondition {
 	status := metav1.ConditionTrue
 	if !success {
 		status = metav1.ConditionFalse
 	}
+	now := metav1.Now()
 	condition := v1alpha3.LinkCondition{
-		LastTransitionTime: metav1.Now(),
+		LastProbeTime:      now,
+		LastTransitionTime: now,
 		Message:            message,
 		Reason:             reason,
 		Status:             status,

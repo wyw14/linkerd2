@@ -64,6 +64,7 @@ func (te *testEnvironment) runEnvironment(watcherQueue workqueue.TypedRateLimiti
 		stopper:                 nil,
 		log:                     logging.WithFields(logging.Fields{"cluster": clusterName}),
 		eventsQueue:             watcherQueue,
+		rateLimiter:             workqueue.DefaultTypedControllerRateLimiter[any](),
 		requeueLimit:            0,
 		headlessServicesEnabled: true,
 	}

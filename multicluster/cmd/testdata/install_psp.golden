@@ -981,6 +981,24 @@ spec:
                 items:
                   description: The status of a mirrored service
                   properties:
+                    endpoints:
+                      description: Endpoints is the number of ready endpoint addresses
+                        currently exposed by the local mirror Service.
+                      format: int32
+                      type: integer
+                    importedVersion:
+                      description: ImportedVersion is the resource version of the remote
+                        Service that was mirrored most recently.
+                      type: string
+                    lastError:
+                      description: LastError is the last error encountered while reconciling
+                        the mirror; it is cleared once reconciliation succeeds.
+                      type: string
+                    retryTimestamp:
+                      description: RetryTimestamp is the time at which the service mirror
+                        will next retry reconciling a mirror that failed.
+                      format: date-time
+                      type: string
                     conditions:
                       description: Conditions of the mirrored service
                       type: array
@@ -1257,6 +1275,24 @@ spec:
                       - name
                       - namespace
                       type: object
+                    endpoints:
+                      description: Endpoints is the number of ready endpoint addresses
+                        currently exposed by the local federated Service.
+                      format: int32
+                      type: integer
+                    importedVersion:
+                      description: ImportedVersion is the resource version of the remote
+                        Service member that was mirrored most recently.
+                      type: string
+                    lastError:
+                      description: LastError is the last error encountered while reconciling
+                        the federated service; it is cleared once reconciliation succeeds.
+                      type: string
+                    retryTimestamp:
+                      description: RetryTimestamp is the time at which the service mirror
+                        will next retry reconciling a federated service that failed.
+                      format: date-time
+                      type: string
                   type: object
                   required:
                   - controllerName
